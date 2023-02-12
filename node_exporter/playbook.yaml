@@ -1,0 +1,125 @@
+---
+- name: Install Node exporter
+  hosts: node_servers
+  become: yes
+
+  vars:
+    #Версия приложения (Например: 1.1.2 или latest)
+    version: latest
+    files_dir: ./files
+    service_file: node_exporter.service
+    env_file: node_exporter
+
+  tasks:
+    - block: #====== Create user and group ===========#
+      - name: Create prometheus group
+        group:
+          system: yes
+          name: prometheus
+
+      - name: Create prometheus user
+        user:
+          name: prometheus
+          group: prometheus
+          create_home: no
+          shell: /sbin/nologin
+          system: yes
+
+    - name: Create temporary directory
+      tempfile:
+        state: directory
+        suffix: temp
+        path: "{{ lookup('env', 'HOME') }}"
+      register: temp_dir
+
+    - block: #====== Get all releases if version != latest ============#
+      - name: Get all releases
+        uri:
+          url: "https://api.github.com/repos/prometheus/node_exporter/releases"
+          body_format: json
+          return_content: yes
+        register: all_releases
+
+      - set_fact: 
+          release_id: "{{ all_releases.content | from_json | json_query(\"[?tag_name=='v\"+version+\"'].id\") | first }}"
+
+      when: version != "latest"
+
+    - name: "Get {{ version }} release"
+      uri:
+        url: "https://api.github.com/repos/prometheus/node_exporter/releases/{{ version if version == 'latest' else release_id }}"
+        body_format: json
+        return_content: yes
+      register: release
+
+    - set_fact: 
+        download_url: "{{ release.content | from_json | json_query('assets[*].browser_download_url') | select('search','linux-amd64') | first }}"
+    - set_fact:
+        node_exporter_arch: "{{ download_url.split('/')[-1] }}"
+
+    - block: #======== Download and extract Node exporter =========#
+      - name: Download Node exporter
+        get_url:
+          force: yes
+          dest: "{{ temp_dir.path }}"
+          url: "{{ download_url }}"
+
+      - name: Extract Node exporter
+        unarchive:
+          src: "{{ temp_dir.path }}/{{ node_exporter_arch }}"
+          dest: "{{ temp_dir.path }}"
+          remote_src: yes
+          list_files: yes
+        register: archive_out
+
+    - block: #========= Copy bin and config files ================#
+      - name: Copy Node exporter
+        copy:
+          src: "{{ temp_dir.path }}/{{ archive_out.files | select('search','/node_exporter') | first }}"
+          dest: /usr/local/bin/
+          mode: '0755'
+          owner: prometheus
+          group: prometheus
+          remote_src: yes
+        notify: Restart and enable node_exporter service
+
+      - name: Copy service file
+        copy:
+          src: "{{ files_dir }}/{{ service_file }}"
+          dest: /etc/systemd/system
+          mode: '0755'
+          owner: root
+          group: root
+        notify: Restart and enable node_exporter service
+
+      - name: Copy environment file
+        copy:
+          src: "{{ files_dir }}/{{ env_file }}"
+          dest: /etc/sysconfig
+          mode: '0644'
+          owner: root
+          group: root
+        notify: Restart and enable node_exporter service
+
+      - name: Flush handlers
+        meta: flush_handlers
+
+    # Нужно выключить или настроить iptables(firewalld)
+    - name: Check prometheus metrics
+      uri:
+        url: "http://{{ansible_default_ipv4.address}}:9100/metrics"
+        timeout: 5
+
+    - name: Remove temporary directory
+      file:
+        state: absent
+        path: "{{ temp_dir.path }}/"
+
+  handlers:
+    # Нужно выключить или настроить selinux
+    - name: Restart and enable node_exporter service
+      systemd:
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+        name: node_exporter
